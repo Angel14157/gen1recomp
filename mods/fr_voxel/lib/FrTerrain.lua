@@ -154,111 +154,27 @@ end
 -- for the ground and wrong for a building: the facade carries WINDOWS, so
 -- the "roof" of the diorama reads as a wall seen from above and the real
 -- roof tiles (where the art has them) never show as a cap.  Raised cells
--- therefore take their top face from a generated COLOUR image -- one flat
--- value per metatile, the average of that quad's opaque pixels.  The cap
--- keeps the tile's own UVs (the colour image is atlas-sized, block per
--- slot), so geometry and atlas addressing stay shared; the facade itself
--- is untouched on the side faces, which is where it belongs.
+-- therefore take their top face from a generated COMPOSITE image: the mid
+-- tile with the over tile laid over its opaque pixels, pixel for pixel --
+-- exactly what the flat field blits, because a top face IS a top-down
+-- view.  An average of those pixels instead read as a foreign surface: a
+-- flat green blob where a canopy has speckle, a colour block where a roof
+-- has shingle rows, and "shifted" art where the silhouettes do not line
+-- up.  The cap keeps the tile's own UVs (the composite is atlas-sized,
+-- block per slot), so geometry and atlas addressing stay shared and the
+-- cap can never disagree with the flat render beside it.  The side faces
+-- stay on the mid atlas, which is where the facade belongs.
 --
--- FRLG paints buildings on the map's OVER layer, so a roof cell's mid
--- slot still carries the grass the house stands on: when a slot's over
--- quad is mostly opaque the cap colour comes from ts.overImageData
--- instead (see overSource), which is what puts the red roof on top.
---
--- Averaging reads the atlas on the CPU once per slot per rebuild, all
+-- The composite reads the atlas on the CPU once per slot per rebuild, all
 -- behind pcall: a driver that refuses getPixel (or an image too exotic to
 -- read) falls back to today's textured top rather than losing the map.
 
 local capWhyWarned = false
--- Cap colour comes from the tile's TOP few rows, not its whole quad: a
--- FireRed building's roof art sits on the upper edge of its tile, so the
--- top strip reads RED where the full average muddies it into wall-grey --
--- and a facade's top strip is the wall ABOVE its windows, which is what
--- keeps windows off every cap. A tile whose top strip is all sky (a fence
--- between posts, a canopy edge) falls back to the full-tile average.
-local function avgRows(img, slot, cols, y0, y1)
-  local iw, ih = img:getDimensions()
-  local sx = (slot % cols) * CELL
-  local sy = math.floor(slot / cols) * CELL
-  if sx + CELL > iw or sy + CELL > ih then return nil end
-  local rr, gg, bb, n = 0, 0, 0, 0
-  for dy = y0, y1 do
-    for dx = 0, CELL - 1 do
-      local ok, pr, pg, pb, pa = pcall(img.getPixel, img, sx + dx, sy + dy)
-      if not ok then
-        if not capWhyWarned then
-          capWhyWarned = true
-          say("getPixel refused: " .. tostring(pr))
-        end
-        return nil, nil, nil, "getPixel"
-      end
-      if pa >= 0.5 then
-        rr, gg, bb, n = rr + pr, gg + pg, bb + pb, n + 1
-      end
-    end
-  end
-  if n == 0 then return nil end
-  return rr / n, gg / n, bb / n
-end
-
-local function readQuadAvg(img, slot, cols)
-  local r, g, b = avgRows(img, slot, cols, 0, 3)
-  if r then return r, g, b end
-  if capWhyWarned then return nil end   -- getPixel itself is broken
-  r, g, b = avgRows(img, slot, cols, 0, CELL - 1)
-  if r then return r, g, b end
-  if not capWhyWarned then
-    capWhyWarned = true
-    say("slot " .. tostring(slot) .. " has no opaque pixels at all")
-  end
-  return nil
-end
-
--- FireRed draws buildings on the OVER layer: a roof cell's mid slot still
--- carries the grass the house stands on, while its over quad (same slot
--- number, parallel atlas -- this is exactly how field_view composites the
--- flat blit) carries the roof itself.  A cap therefore reads the over
--- atlas when that slot's over quad is MOSTLY opaque; sparse overhangs
--- (tree tops, signs) keep the mid quad, which is what still shows through
--- the holes of the 2D draw.  Same atlas geometry, so the cap's UVs and
--- the colour image stay sized for either source.
-local OVER_OPAQUE_MIN = 192   -- opaque px out of 256 for "the over IS the art"
-
-local function overSource(chunk, slot)
-  local ts = chunk.ts
-  local odata = ts and ts.overImageData
-  if not (odata and odata.getPixel and chunk.pixels) then return nil end
-  chunk.overOK = chunk.overOK or {}
-  local v = chunk.overOK[slot]
-  if v == nil then
-    local iw, ih = chunk.pixels:getDimensions()
-    local okD, ow, oh = pcall(function() return odata:getDimensions() end)
-    if not okD or ow ~= iw or oh ~= ih then
-      v = false
-    else
-      local cols = ts.cols
-      local sx = (slot % cols) * CELL
-      local sy = math.floor(slot / cols) * CELL
-      local n = 0   -- must predate the closure: locals inits run after it
-      local okS = pcall(function()
-        for dy = 0, CELL - 1 do
-          for dx = 0, CELL - 1 do
-            local _, _, _, pa = odata:getPixel(sx + dx, sy + dy)
-            if pa >= 0.5 then n = n + 1 end
-          end
-        end
-      end)
-      v = okS and n >= OVER_OPAQUE_MIN or false
-    end
-    chunk.overOK[slot] = v
-  end
-  if v then return odata end
-  return nil
-end
 
 --- Make sure this chunk can answer cap faces: builds the atlas-sized
--- colour image on first need and fills the block for `slot`.  Returns
--- true when the slot has a colour, false for a graceful textured fallback.
+-- composite image on first need and lays down the block for `slot`.
+-- Returns true when the slot has cap art, false for a graceful textured
+-- fallback.
 local function capReady(chunk, slot)
   if chunk.capDead then return false end
   -- Read the atlas on the CPU. love.graphics Images have no getPixel and
@@ -299,25 +215,44 @@ local function capReady(chunk, slot)
   end
   if chunk.capFilled[slot] then return true end
   if chunk.capBad and chunk.capBad[slot] then return false end
-  local src = overSource(chunk, slot) or pixels
-  local ok, r, g, b = pcall(readQuadAvg, src, slot, chunk.ts.cols)
-  if not ok or r == nil then
+  local cols = chunk.ts.cols
+  local iw, ih = pixels:getDimensions()
+  local sx = (slot % cols) * CELL
+  local sy = math.floor(slot / cols) * CELL
+  if sx + CELL > iw or sy + CELL > ih then
     chunk.capBad = chunk.capBad or {}
     chunk.capBad[slot] = true
     return false
   end
-  local sx = (slot % chunk.ts.cols) * CELL
-  local sy = math.floor(slot / chunk.ts.cols) * CELL
-  local okW = pcall(function()
+  local odata = chunk.ts and chunk.ts.overImageData
+  if odata then
+    local okD, ow, oh = pcall(function() return odata:getDimensions() end)
+    if not okD or ow ~= iw or oh ~= ih or not odata.getPixel then
+      odata = nil
+    end
+  end
+  local okW, errW = pcall(function()
     for dy = 0, CELL - 1 do
       for dx = 0, CELL - 1 do
-        chunk.capData:setPixel(sx + dx, sy + dy, r, g, b, 1)
+        local okM, mr, mg, mb, ma = pixels:getPixel(sx + dx, sy + dy)
+        if not okM then error(mr, 0) end
+        local r, g, b, a = mr, mg, mb, ma
+        if odata then
+          local okO, orr, og, ob, oa = odata:getPixel(sx + dx, sy + dy)
+          if not okO then error(orr, 0) end
+          if oa >= 0.5 then r, g, b, a = orr, og, ob, oa end
+        end
+        chunk.capData:setPixel(sx + dx, sy + dy, r, g, b, a)
       end
     end
   end)
   if not okW then
-    chunk.capDead = true
-    say("cap fallback: setPixel refused")
+    if not capWhyWarned then
+      capWhyWarned = true
+      say("cap composite refused: " .. tostring(errW))
+    end
+    chunk.capBad = chunk.capBad or {}
+    chunk.capBad[slot] = true
     return false
   end
   chunk.capFilled[slot] = true
