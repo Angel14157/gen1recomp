@@ -259,8 +259,9 @@ end
 
 -- One quad: four vertices, six indices, in the shared Voxel3D shape.  The
 -- quad index is read back off the index list itself, so each chunk counts
--- its own quads.
-local function emitFace(chunk, faceId, x, z, y0, y1, uv)
+-- its own quads.  `skirt` (nil except on a tall side) carries the LOWER
+-- neighbour's art top for the bank below the 1:1 span.
+local function emitFace(chunk, faceId, x, z, y0, y1, uv, skirt)
   local verts, indices = chunk.verts, chunk.indices
   local corners = Voxel3D.FACE_CORNERS[faceId]
   local au, av = FACE_U[faceId], FACE_V[faceId]
@@ -277,20 +278,49 @@ local function emitFace(chunk, faceId, x, z, y0, y1, uv)
   -- fence post upside down against the flat field's copy of the same tile.
   -- Top faces keep the direct mapping: their v rides the world's z, which
   -- already runs art-north at the north edge.
-  for i = 1, 4 do
-    local c = corners[i]
-    local v = uv.v0 + c[av] * dv
-    if av == 2 then v = uv.v1 - c[av] * dv end
-    verts[#verts + 1] = {
-      x + c[1] * CELL,
-      y0 + c[2] * dy,
-      z + c[3] * CELL,
-      uv.u0 + c[au] * du,
-      v,
-      shade,
-    }
+  --
+  -- A side taller than one tile (a shore face dropping 20px to the water
+  -- plane, a map-edge skirt) does not stretch the whole tile over the
+  -- span: the top CELL world pixels wear the art 1:1 and the skirt below
+  -- wears the lower neighbour's art top rows (the waterline, the path
+  -- under a ledge) -- opaque bank material instead of the face's own,
+  -- possibly transparent, bottom rows.  Without neighbour art the skirt
+  -- extends the face's own bottom row.  The skirt samples row CENTERS,
+  -- not the v1 edge: at exactly v1 the nearest sampler rounds into the
+  -- next slot's first row, which discards into a black band.  16px sides
+  -- are untouched.
+  local spans = { { y0, y1, false } }
+  if av == 2 and dy > CELL then
+    spans = { { y1 - CELL, y1, false }, { y0, y1 - CELL, true } }
   end
-  Voxel3D.pushQuad(indices, #indices / 6)
+  for _, s in ipairs(spans) do
+    local b0, b1, isSkirt = s[1], s[2], s[3]
+    local sv0, sdvn = uv.v1 - dv / (2 * CELL), 0
+    if skirt then sv0, sdvn = skirt.v0, skirt.dvn end
+    local shFrac = (b1 - b0) / CELL
+    for i = 1, 4 do
+      local c = corners[i]
+      local yw, v
+      if av == 2 then
+        local f = c[2]   -- 0 = this quad's bottom, 1 = its top
+        yw = b0 + f * (b1 - b0)
+        if isSkirt then v = sv0 + (1 - f) * shFrac * sdvn
+        else v = uv.v1 - f * dv end
+      else
+        yw = y0 + c[2] * dy
+        v = uv.v0 + c[av] * dv
+      end
+      verts[#verts + 1] = {
+        x + c[1] * CELL,
+        yw,
+        z + c[3] * CELL,
+        uv.u0 + c[au] * du,
+        v,
+        shade,
+      }
+    end
+    Voxel3D.pushQuad(indices, #indices / 6)
+  end
 end
 
 local function worldSignature(reachW, reachH)
@@ -352,6 +382,7 @@ function FrTerrain.ensure(game, vw, vh)
 
   -- pass one: resolve every cell's tile, height and atlas rectangle
   local cells, atlasOf = {}, {}
+  local uvGrid, pairGrid = {}, {}   -- neighbour art lookup for side skirts
   local n, skipped = 0, 0
   for cy = y0, y1 do
     for cx = x0, x1 do
@@ -380,6 +411,8 @@ function FrTerrain.ensure(game, vw, vh)
           n = n + 1
           cells[n] = { cx = cx, cy = cy, y = y, uv = uv, slot = slot,
                        chunk = chunk }
+          local gi = (cy - y0) * W + (cx - x0) + 1
+          uvGrid[gi], pairGrid[gi] = uv, pair
         else
           skipped = skipped + 1
         end
@@ -408,6 +441,20 @@ function FrTerrain.ensure(game, vw, vh)
     return scratch[(cy - y0) * W + (cx - x0) + 1] or SKIRT
   end
 
+  -- The bank below a tall side face wears the LOWER neighbour's art (the
+  -- waterline under a shore face, the path under a ledge): its tile top
+  -- rows, 1:1 from the skirt's own top.  nil when the neighbour is off
+  -- the meshed window, unmeshed, or from another atlas -- then the skirt
+  -- falls back to the face's own bottom row.
+  local function skirtFor(nx, ny, pair)
+    if nx < x0 or nx > x1 or ny < y0 or ny > y1 then return nil end
+    local i = (ny - y0) * W + (nx - x0) + 1
+    if pairGrid[i] ~= pair then return nil end
+    local nuv = uvGrid[i]
+    if not nuv then return nil end
+    return { v0 = nuv.v0, dvn = nuv.v1 - nuv.v0 }
+  end
+
   -- pass two: top face, plus whichever side faces a lower neighbour leaves
   capWanted, capRouted = 0, 0
   for i = 1, n do
@@ -415,8 +462,9 @@ function FrTerrain.ensure(game, vw, vh)
     local cx, cy, y, uv = cell.cx, cell.cy, cell.y, cell.uv
     local chunk = cell.chunk
     local wx, wz = cx * CELL, cy * CELL
-    -- a raised cell's top is a CAP (solid per-tile colour, see capReady);
-    -- ground and anything a cap colour could not be read keep the texture
+    -- a raised cell's top is a CAP (the mid-plus-over composite, see
+    -- capReady); ground and anything a cap could not be read keep the
+    -- mid texture
     local top = chunk
     if y > 0 then
       capWanted = capWanted + 1
@@ -428,16 +476,20 @@ function FrTerrain.ensure(game, vw, vh)
     end
     emitFace(top, 3, wx, wz, y, y, uv)
     local e = heightAt(cx + 1, cy)
-    if e < y then emitFace(chunk, 1, wx, wz, e, y, uv) end
+    if e < y then emitFace(chunk, 1, wx, wz, e, y, uv,
+      (y - e > CELL) and skirtFor(cx + 1, cy, chunk.pair) or nil) end
     e = heightAt(cx - 1, cy)
-    if e < y then emitFace(chunk, 2, wx, wz, e, y, uv) end
+    if e < y then emitFace(chunk, 2, wx, wz, e, y, uv,
+      (y - e > CELL) and skirtFor(cx - 1, cy, chunk.pair) or nil) end
     e = heightAt(cx, cy + 1)
-    if e < y then emitFace(chunk, 5, wx, wz, e, y, uv) end
+    if e < y then emitFace(chunk, 5, wx, wz, e, y, uv,
+      (y - e > CELL) and skirtFor(cx, cy + 1, chunk.pair) or nil) end
     e = heightAt(cx, cy - 1)
-    if e < y then emitFace(chunk, 6, wx, wz, e, y, uv) end
+    if e < y then emitFace(chunk, 6, wx, wz, e, y, uv,
+      (y - e > CELL) and skirtFor(cx, cy - 1, chunk.pair) or nil) end
   end
 
-  say(("caps: %d of %d raised tops routed to colour"):format(
+  say(("caps: %d of %d raised tops routed to art"):format(
     capRouted, capWanted))
 
   local out, count = {}, 0
