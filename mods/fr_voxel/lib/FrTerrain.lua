@@ -234,12 +234,10 @@ local function capReady(chunk, slot)
   local okW, errW = pcall(function()
     for dy = 0, CELL - 1 do
       for dx = 0, CELL - 1 do
-        local okM, mr, mg, mb, ma = pixels:getPixel(sx + dx, sy + dy)
-        if not okM then error(mr, 0) end
+        local mr, mg, mb, ma = pixels:getPixel(sx + dx, sy + dy)
         local r, g, b, a = mr, mg, mb, ma
         if odata then
-          local okO, orr, og, ob, oa = odata:getPixel(sx + dx, sy + dy)
-          if not okO then error(orr, 0) end
+          local orr, og, ob, oa = odata:getPixel(sx + dx, sy + dy)
           if oa >= 0.5 then r, g, b, a = orr, og, ob, oa end
         end
         chunk.capData:setPixel(sx + dx, sy + dy, r, g, b, a)
@@ -271,15 +269,24 @@ local function emitFace(chunk, faceId, x, z, y0, y1, uv)
   local du, dv = uv.u1 - uv.u0, uv.v1 - uv.v0
   -- one ROW per vertex: love.graphics.newMesh refuses a flat number list
   -- ("expected table of tables"), so rows are what the mesher emits and
-  -- what Voxel3D.newMesh passes straight through
+  -- what Voxel3D.newMesh passes straight through.
+  --
+  -- A SIDE face stands the tile UPRIGHT: the atlas is y-down, so the art's
+  -- top row (uv.v0) has to land on the face's TOP, not follow the corner
+  -- number up from the bottom -- following it drew every facade, trunk and
+  -- fence post upside down against the flat field's copy of the same tile.
+  -- Top faces keep the direct mapping: their v rides the world's z, which
+  -- already runs art-north at the north edge.
   for i = 1, 4 do
     local c = corners[i]
+    local v = uv.v0 + c[av] * dv
+    if av == 2 then v = uv.v1 - c[av] * dv end
     verts[#verts + 1] = {
       x + c[1] * CELL,
       y0 + c[2] * dy,
       z + c[3] * CELL,
       uv.u0 + c[au] * du,
-      uv.v0 + c[av] * dv,
+      v,
       shade,
     }
   end
@@ -295,6 +302,16 @@ local function worldSignature(reachW, reachH)
     s = s .. ";" .. tostring(e.id) .. "@" .. tostring(e.ox) .. "," .. tostring(e.oy)
   end
   return s
+end
+
+-- How the LAST build routed raised tops, kept for capStats(): a zero here
+-- with raised cells on screen means the atlas read died and every top
+-- silently fell back to raw mid art -- green roofs, untextured canopies.
+local capRouted, capWanted = 0, 0
+
+--- Raised tops routed to the composite, out of raised tops wanted.
+function FrTerrain.capStats()
+  return capRouted, capWanted
 end
 
 --- Make sure the mesh matches the world the field is showing.
@@ -392,7 +409,7 @@ function FrTerrain.ensure(game, vw, vh)
   end
 
   -- pass two: top face, plus whichever side faces a lower neighbour leaves
-  local capWanted, capRouted = 0, 0
+  capWanted, capRouted = 0, 0
   for i = 1, n do
     local cell = cells[i]
     local cx, cy, y, uv = cell.cx, cell.cy, cell.y, cell.uv

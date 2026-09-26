@@ -225,6 +225,21 @@ return function(game)
         or (probe and tostring(active) or "no scene.shadow export"))
   end
 
+  -- every raised top wants a composite cap; a shortfall means the atlas
+  -- read refused and the tops silently fell back to raw mid art (the
+  -- green-roof failure).  Same loader path as the shadow probe above.
+  do
+    local loader = game.mods
+    local scene = loader and loader.exports and loader.exports.fr_voxel
+      and loader.exports.fr_voxel.scene
+    local probe = scene and scene.caps
+    local okCall, routed, wanted = pcall(probe)
+    result(okCall and type(wanted) == "number" and wanted > 0
+      and routed == wanted, "every raised top got its cap art",
+      okCall and (tostring(routed) .. " of " .. tostring(wanted))
+        or (probe and tostring(routed) or "no scene.caps export"))
+  end
+
   -- --------------------------------------------- the rest of the ladder
   key("6")
   U.wait(30)

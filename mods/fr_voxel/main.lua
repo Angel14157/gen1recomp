@@ -134,4 +134,9 @@ mod.exports.scene = {
   shadow = function()
     return ShadowMap.active(), ShadowMap.res, ShadowMap.bias
   end,
+  -- how the last build routed raised tops: routed, wanted.  A shortfall
+  -- means the atlas read fell back and the tops went flat mid art
+  caps = function()
+    return FrTerrain.capStats()
+  end,
 }
