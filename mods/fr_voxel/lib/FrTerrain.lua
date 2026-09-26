@@ -171,34 +171,97 @@ end
 
 local capWhyWarned = false
 
+-- The CPU-readable mid atlas for this chunk, resolved once and kept.
+-- nil when the driver refuses every read path (then caps die too, and
+-- vegetation keeps full height).
+local function chunkPixels(chunk)
+  local pixels = chunk.pixels
+  if pixels ~= nil then return pixels end
+  -- Read the atlas on the CPU. love.graphics Images have no getPixel and
+  -- canvases no newImageData: the native tileset hands its ImageData
+  -- alongside the GPU image (tileset_native keeps `imageData`), which is
+  -- also the buffer the palette repaint writes, so it stays in sync.
+  local img = chunk.image
+  local data = chunk.ts and chunk.ts.imageData
+  if not (data and data.getPixel) and img.getPixel then
+    data = img
+  end
+  if not (data and data.getPixel) and img.newImageData then
+    local okD, d = pcall(function() return img:newImageData() end)
+    data = okD and d or nil
+  end
+  if not (data and data.getPixel) then return nil end
+  chunk.pixels = data
+  return data
+end
+
+-- Vegetation height cue, cached per chunk and slot: a solid cell whose
+-- mid is plain grass and whose over is sparse is a bush or flower clump,
+-- not a tree -- it rises half a tile so the crowns stand clear of the
+-- undergrowth instead of every green cell walling up to full height and
+-- reading as one shrub wall.  Roofs and crowns (dense over) and walls,
+-- fences and signs (structured mid) keep full height; unreadable art
+-- keeps full height too.
+local VEG_GREEN_MIN, VEG_GRAY_MAX, VEG_RED_MAX, VEG_OVER_MAX =
+  200, 40, 40, 191
+
+local function lowVeg(chunk, slot)
+  chunk.veg = chunk.veg or {}
+  local v = chunk.veg[slot]
+  if v ~= nil then return v end
+  v = false
+  local pixels = chunkPixels(chunk)
+  local odata = chunk.ts and chunk.ts.overImageData
+  if pixels and odata then
+    local ok, low = pcall(function()
+      local cols = chunk.ts.cols
+      local iw, ih = pixels:getDimensions()
+      local ow, oh = odata:getDimensions()
+      assert(ow == iw and oh == ih)
+      local sx = (slot % cols) * CELL
+      local sy = math.floor(slot / cols) * CELL
+      assert(sx + CELL <= iw and sy + CELL <= ih)
+      local g, gy, r, o = 0, 0, 0, 0
+      for dy = 0, CELL - 1 do
+        for dx = 0, CELL - 1 do
+          local mr, mg, mb, ma = pixels:getPixel(sx + dx, sy + dy)
+          if ma >= 0.5 then
+            if mg > mr + 0.1 and mg > mb + 0.1 then
+              g = g + 1
+            elseif math.abs(mr - mg) < 0.1 and math.abs(mg - mb) < 0.1
+              and mr > 0.4 then
+              gy = gy + 1
+            elseif mr > mg + 0.12 and mr > mb + 0.12 then
+              r = r + 1
+            end
+          end
+          local _, _, _, oa = odata:getPixel(sx + dx, sy + dy)
+          if oa >= 0.5 then
+            o = o + 1
+            if o > VEG_OVER_MAX then return false end
+          end
+        end
+      end
+      return g >= VEG_GREEN_MIN and gy <= VEG_GRAY_MAX
+        and r <= VEG_RED_MAX
+    end)
+    v = ok and low or false
+  end
+  chunk.veg[slot] = v
+  return v
+end
+
 --- Make sure this chunk can answer cap faces: builds the atlas-sized
 -- composite image on first need and lays down the block for `slot`.
 -- Returns true when the slot has cap art, false for a graceful textured
 -- fallback.
 local function capReady(chunk, slot)
   if chunk.capDead then return false end
-  -- Read the atlas on the CPU. love.graphics Images have no getPixel and
-  -- canvases no newImageData: the native tileset hands its ImageData
-  -- alongside the GPU image (tileset_native keeps `imageData`), which is
-  -- also the buffer the palette repaint writes, so it stays in sync.
-  local pixels = chunk.pixels
+  local pixels = chunkPixels(chunk)
   if pixels == nil then
-    local img = chunk.image
-    local data = chunk.ts and chunk.ts.imageData
-    if not (data and data.getPixel) and img.getPixel then
-      data = img
-    end
-    if not (data and data.getPixel) and img.newImageData then
-      local okD, d = pcall(function() return img:newImageData() end)
-      data = okD and d or nil
-    end
-    if not (data and data.getPixel) then
-      chunk.capDead = true
-      say("cap fallback: no CPU-readable atlas")
-      return false
-    end
-    pixels = data
-    chunk.pixels = pixels
+    chunk.capDead = true
+    say("cap fallback: no CPU-readable atlas")
+    return false
   end
   if not chunk.capData then
     local ok, data = pcall(function()
@@ -395,7 +458,7 @@ function FrTerrain.ensure(game, vw, vh)
       elseif not passable(coll) then
         y = CELL
       end
-      scratch[(cy - y0) * W + (cx - x0) + 1] = y
+      local gi = (cy - y0) * W + (cx - x0) + 1
 
       local pair = def.pair or L.pair or rootDef.pair or "?"
       local chunk = atlasOf[pair]
@@ -408,15 +471,20 @@ function FrTerrain.ensure(game, vw, vh)
       if chunk then
         local uv, slot = uvFor(chunk.ts, mid)
         if uv then
+          -- bushes and flower clumps (plain-grass mid, sparse over) rise
+          -- half a tile: full height is for crowns, roofs and walls
+          if y == CELL and lowVeg(chunk, slot) then y = CELL / 2 end
+          scratch[gi] = y
           n = n + 1
           cells[n] = { cx = cx, cy = cy, y = y, uv = uv, slot = slot,
                        chunk = chunk }
-          local gi = (cy - y0) * W + (cx - x0) + 1
           uvGrid[gi], pairGrid[gi] = uv, pair
         else
+          scratch[gi] = y
           skipped = skipped + 1
         end
       else
+        scratch[gi] = y
         skipped = skipped + 1
       end
     end
@@ -464,28 +532,33 @@ function FrTerrain.ensure(game, vw, vh)
     local wx, wz = cx * CELL, cy * CELL
     -- a raised cell's top is a CAP (the mid-plus-over composite, see
     -- capReady); ground and anything a cap could not be read keep the
-    -- mid texture
-    local top = chunk
+    -- mid texture.  The SIDES of a raised cell ride the same routing:
+    -- the mid alone is often not the visible surface at all (grass under
+    -- a roof, the green under-canopy under a tree crown), so mid-only
+    -- sides read as foreign green bands against the flat field's
+    -- composite -- the flat blit is mid-plus-over everywhere, and the
+    -- sides match it only through the same image.
+    local top, side = chunk, chunk
     if y > 0 then
       capWanted = capWanted + 1
       if capReady(chunk, cell.slot) then
         chunk.cap = chunk.cap or { verts = {}, indices = {} }
-        top = chunk.cap
+        top, side = chunk.cap, chunk.cap
         capRouted = capRouted + 1
       end
     end
     emitFace(top, 3, wx, wz, y, y, uv)
     local e = heightAt(cx + 1, cy)
-    if e < y then emitFace(chunk, 1, wx, wz, e, y, uv,
+    if e < y then emitFace(side, 1, wx, wz, e, y, uv,
       (y - e > CELL) and skirtFor(cx + 1, cy, chunk.pair) or nil) end
     e = heightAt(cx - 1, cy)
-    if e < y then emitFace(chunk, 2, wx, wz, e, y, uv,
+    if e < y then emitFace(side, 2, wx, wz, e, y, uv,
       (y - e > CELL) and skirtFor(cx - 1, cy, chunk.pair) or nil) end
     e = heightAt(cx, cy + 1)
-    if e < y then emitFace(chunk, 5, wx, wz, e, y, uv,
+    if e < y then emitFace(side, 5, wx, wz, e, y, uv,
       (y - e > CELL) and skirtFor(cx, cy + 1, chunk.pair) or nil) end
     e = heightAt(cx, cy - 1)
-    if e < y then emitFace(chunk, 6, wx, wz, e, y, uv,
+    if e < y then emitFace(side, 6, wx, wz, e, y, uv,
       (y - e > CELL) and skirtFor(cx, cy - 1, chunk.pair) or nil) end
   end
 
