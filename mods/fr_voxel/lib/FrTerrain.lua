@@ -588,6 +588,27 @@ function FrTerrain.draw()
   return drew
 end
 
+--- Draw every built chunk into the sun's shadow map (ShadowMap's pass).
+-- Same geometry as draw(), minus camera business: model is identity
+-- because the meshes already live in world coordinates, and there is no
+-- pull (a shadow must not ride toward the camera).
+function FrTerrain.cast()
+  local ShadowMap = V.require("ShadowMap")
+  if not meshes then return end
+  for _, e in pairs(meshes) do
+    if e.mesh then ShadowMap.draw(e.mesh, e.image, nil) end
+    if e.capMesh then ShadowMap.draw(e.capMesh, e.capImage, nil) end
+  end
+end
+
+--- A stamp of everything that changes what the shadow map would hold:
+-- the world signature that rebuilt the meshes, plus the dirty flag (a
+-- rebuild pending means the meshes are about to change).  ShadowMap's
+-- staleness check compares this to decide whether to recast.
+function FrTerrain.stateSig()
+  return (signature or "") .. (dirty and "d" or "")
+end
+
 function FrTerrain.ready()
   return meshes ~= nil
 end

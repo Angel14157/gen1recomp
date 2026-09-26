@@ -123,31 +123,38 @@ return function(game)
     "ladder is OFF/PALLET/+ROUTE 1/ALL")
 
   -- --------------------------------------------- GLSL ES gate (Android)
-  -- The phone build compiles this exact source through LÖVE's GLES driver,
-  -- and the scene shader is the only shader the diorama owns (ShadowMap
-  -- rides on it).  validateShader(gles=true, ...) relabels the source as ES
-  -- without creating a Shader object, so it is a pure compile gate.
+  -- The phone build compiles these exact sources through LÖVE's GLES
+  -- driver: the scene shader and the sun pass's pack shader are every
+  -- shader the diorama owns.  validateShader(gles=true, ...) relabels the
+  -- source as ES without creating a Shader object, so it is a pure
+  -- compile gate.
   do
-    local raw = love.filesystem.read("mods/fr_voxel/lib/Voxel3D.lua")
-    -- string.match returns every capture, so the long-bracket level must
-    -- stay un-captured: "(=*)" would win the race and return "" instead of
-    -- the body.
-    local body = raw and (raw:match("local SHADER%s*=%s*%[%[(.-)%]%]")
-      or raw:match("local SHADER%s*=%s*%[=(.-)%]="))
-    if result(body ~= nil, "scene shader source readable for the ES check",
-        body and (#body .. " bytes") or "Voxel3D SHADER literal not found") then
-      local real = love.graphics.getSupported
-      for _, g3 in ipairs({ true, false }) do
-        love.graphics.getSupported = function()
-          local t = real()
-          t.glsl3 = g3
-          return t
+    local real = love.graphics.getSupported
+    for _, file in ipairs({ "mods/fr_voxel/lib/Voxel3D.lua",
+                            "mods/fr_voxel/lib/ShadowMap.lua" }) do
+      local label = file:match("([^/]+)$")
+      local raw = love.filesystem.read(file)
+      -- string.match returns every capture, so the long-bracket level must
+      -- stay un-captured: "(=*)" would win the race and return "" instead
+      -- of the body.
+      local body = raw and (raw:match("local SHADER%s*=%s*%[%[(.-)%]%]")
+        or raw:match("local SHADER%s*=%s*%[=(.-)%]="))
+      if result(body ~= nil,
+          label .. " shader source readable for the ES check",
+          body and (#body .. " bytes") or "SHADER literal not found") then
+        for _, g3 in ipairs({ true, false }) do
+          love.graphics.getSupported = function()
+            local t = real()
+            t.glsl3 = g3
+            return t
+          end
+          local okCall, ok, err = pcall(love.graphics.validateShader, true, body)
+          love.graphics.getSupported = real
+          result(okCall and ok == true,
+            ("%s shader compiles as GLSL ES (glsl3=%s)"):format(
+              label, tostring(g3)),
+            okCall and (ok == true and "ok" or tostring(err)) or tostring(ok))
         end
-        local okCall, ok, err = pcall(love.graphics.validateShader, true, body)
-        love.graphics.getSupported = real
-        result(okCall and ok == true,
-          ("scene shader compiles as GLSL ES (glsl3=%s)"):format(tostring(g3)),
-          okCall and (ok == true and "ok" or tostring(err)) or tostring(ok))
       end
     end
   end
@@ -202,6 +209,21 @@ return function(game)
   local dioramaFps = measure(game, "Pallet diorama rung 1", 240)
   U.log(("pallet: flat %.1f fps -> diorama %.1f fps (%+.0f%%)")
     :format(flatFps, dioramaFps, (dioramaFps / flatFps - 1) * 100))
+
+  -- the sun's pass must be holding a map by now: FrScene recasts during
+  -- the frames above whenever the camera or the terrain changed.
+  -- Loader keeps api.exports at loader.exports[modId] (Loader.lua:1613).
+  do
+    local loader = game.mods
+    local scene = loader and loader.exports and loader.exports.fr_voxel
+      and loader.exports.fr_voxel.scene
+    local probe = scene and scene.shadow
+    local okCall, active, res, bias = pcall(probe)
+    result(okCall and active == true, "shadow map is active on the diorama",
+      okCall and ("res=" .. tostring(res) .. " bias="
+        .. tostring(math.floor((bias or 0) * 1000) / 1000))
+        or (probe and tostring(active) or "no scene.shadow export"))
+  end
 
   -- --------------------------------------------- the rest of the ladder
   key("6")

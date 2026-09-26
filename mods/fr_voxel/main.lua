@@ -62,6 +62,7 @@ end
 
 local Voxel = V.require("VoxelState")
 local Voxel3D = V.require("Voxel3D")
+local ShadowMap = V.require("ShadowMap")
 local FrTerrain = V.require("FrTerrain")
 local FrScene = V.require("FrScene")
 
@@ -128,4 +129,9 @@ mod.exports.scene = {
   allowed = FrScene.allowed,
   markDirty = FrTerrain.markDirty,
   invalidate = FrScene.invalidate,
+  -- whether the sun's pass holds a map this frame, and at what rung:
+  -- the one shadow question a test can ask without owning the frame
+  shadow = function()
+    return ShadowMap.active(), ShadowMap.res, ShadowMap.bias
+  end,
 }

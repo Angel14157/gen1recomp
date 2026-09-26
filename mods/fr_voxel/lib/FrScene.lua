@@ -15,6 +15,7 @@ local Voxel3D = V.require("Voxel3D")
 local Voxel = V.require("VoxelState")
 local FrTerrain = V.require("FrTerrain")
 local FrActors = V.require("FrActors")
+local ShadowMap = V.require("ShadowMap")
 
 local FrScene = {}
 
@@ -112,6 +113,20 @@ function FrScene.render(ctx)
   local w, h = sceneSize(ctx)
   local cx = ctx.cam.x + vw / 2
   local cy = ctx.cam.y + vh / 2
+
+  -- The sun's own pass first: render the world from the sun into the
+  -- shadow map, so beginScene can bind it while the scene opens.  The
+  -- signature covers the camera and the terrain -- a frame that changes
+  -- neither (a dialog, standing still) reuses the map it already has.
+  -- A pass that cannot start (headless, no canvas) leaves active() false
+  -- and the scene renders with sunDark = 0, exactly as before.
+  local sig = table.concat({ cx, cy, vw, vh, tostring(Voxel.angle or 0),
+                             FrTerrain.stateSig() }, ":")
+  if ShadowMap.stale(sig) and ShadowMap.begin(cx, cy, vw, vh) then
+    FrTerrain.cast()
+    ShadowMap.finish(sig)
+  end
+
   if not Voxel3D.beginScene(w, h, cx, cy, vw, vh, SKY) then
     dbg(("decline: beginScene %dx%d refused"):format(w, h))
     return nil
