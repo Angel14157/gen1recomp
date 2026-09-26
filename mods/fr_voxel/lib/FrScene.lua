@@ -140,7 +140,7 @@ function FrScene.render(ctx)
   end
 
   if Voxel3D.beginOverlay() then
-    FrActors.draw(ctx, ctx.actors)
+    FrActors.draw(ctx, ctx.actors, w, h)
     Voxel3D.endOverlay()
   end
   dbg(("frame ok: canvas %s"):format(tostring(canvas)))

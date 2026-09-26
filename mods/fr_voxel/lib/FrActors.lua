@@ -28,10 +28,31 @@ end
 
 --- Draw every collected actor into the scene canvas.
 -- `cast` is FieldView.pipelineActors' result; `ctx.state` is the game.
-function FrActors.draw(ctx, cast)
+-- `w, h` is the scene canvas in framebuffer pixels: the flat path draws
+-- its sprites in WORLD pixels and lets the viewport blit stretch them to
+-- the screen, while this overlay draws straight into the full-resolution
+-- canvas -- so without the world->canvas factor here a 16px sprite lands
+-- as 16 canvas pixels, a few times too small on any screen bigger than
+-- 240x160.  The projection supplies the depth half (k); the framing
+-- supplies the rest, exactly as viewProjection maps the terrain mesh.
+function FrActors.draw(ctx, cast, w, h)
   if not (ctx and cast) then return end
   local F = fieldView()
   if not F then return end
+  local vw = tonumber(ctx.vw) or 240
+  local vh = tonumber(ctx.vh) or 160
+  w, h = tonumber(w), tonumber(h)
+  if not (w and h and w > 0 and h > 0) then
+    if love.graphics.getPixelDimensions then
+      w, h = love.graphics.getPixelDimensions()
+    else
+      w, h = 240, 160
+    end
+  end
+  -- canvas pixels per world pixel at the focus plane: viewProjection
+  -- frames vw x vh there and divides clip by w, so both axes come out
+  -- of the canvas and the view, in that order
+  local bx, by = w / vw, h / vh
   local list = {}
   for _, a in ipairs(cast.under or {}) do list[#list + 1] = a end
   for _, a in ipairs(cast.over or {}) do list[#list + 1] = a end
@@ -46,11 +67,12 @@ function FrActors.draw(ctx, cast)
     if sx and sy then
       k = tonumber(k) or 1
       if k < 0.05 then k = 0.05 elseif k > 8 then k = 8 end
+      local tx, ty = k * bx, k * by
       love.graphics.push()
-      love.graphics.scale(k, k)
-      -- slide the flat camera so this actor's feet land on (sx/k, sy/k),
-      -- which the scale below puts back on (sx, sy)
-      F.drawActor(ctx.state, cast.mapDef, a, fx - sx / k, fy - sy / k)
+      love.graphics.scale(tx, ty)
+      -- slide the flat camera so this actor's feet land on (sx/tx, sy/ty),
+      -- which the scale above puts back on (sx, sy)
+      F.drawActor(ctx.state, cast.mapDef, a, fx - sx / tx, fy - sy / ty)
       love.graphics.pop()
     end
   end
